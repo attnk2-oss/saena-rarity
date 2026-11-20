@@ -9,6 +9,7 @@ Model: decompose rate = holders / tracked.
     Power-law extrapolation with a decaying exponent, uncertainty widening per decade.
   - holders_c(t): players having earned trophy c, also power-law with decay.
   - Poisson granularity for small holder counts, tier-median prior for zero-holder cups.
+  Dilution-aware rarity quantiles
   - Quantiles: logit-space sigma from combined multiplicative uncertainty, floored
     so a single Exophase refresh cannot blow the band (house practice lesson).
 """
