@@ -1,193 +1,302 @@
 #!/usr/bin/env python3
-"""GTA VI PS5 trophy earn-rate forecaster for make.fun gta6-trophy-rarity-forecast-01.
+"""Deterministic GTA VI trophy earn-rate forecaster for make.fun cases."""
 
-Reads the case at /input/<id>.in, writes quantiles to /output/<id>.out.
-Pure stdlib, deterministic (two runs byte-identical), runs in <8s / 1GB.
+from __future__ import annotations
 
-Model: decompose rate = holders / tracked.
-  - tracked(t): the page's players-tracked count, grows as players sync profiles.
-    Power-law extrapolation with a decaying exponent, uncertainty widening per decade.
-  - holders_c(t): players having earned trophy c, also power-law with decay.
-  - Poisson granularity for small holder counts, tier-median prior for zero-holder cups.
-  Dilution-aware rarity quantiles
-  - Quantiles: logit-space sigma from combined multiplicative uncertainty, floored
-    so a single Exophase refresh cannot blow the band (house practice lesson).
-"""
-import json, math, os, sys, re
+import json
+import math
+import os
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterable, Sequence
 
-TAU_Z = {0.05: -1.6448536269514722, 0.25: -0.6744897501960817,
-         0.50: 0.0, 0.75: 0.6744897501960817, 0.95: 1.6448536269514722}
-TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
 
-def clamp_logit(x):
-    x = min(99.99, max(0.01, x))
-    p = x / 100.0
+QUANTILE_Z = (-1.6449, -0.6745, 0.0, 0.6745, 1.6449)
+MIN_PERCENT = 0.01
+MAX_PERCENT = 99.99
+EPS = 1.0e-12
+
+
+def parse_rfc3339(value: str) -> datetime:
+    """Parse an RFC3339 timestamp and normalize it to UTC."""
+    text = str(value).strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def hours_between(start: datetime, end: datetime) -> float:
+    return (end - start).total_seconds() / 3600.0
+
+
+def linear_fit(xs: Sequence[float], ys: Sequence[float]) -> tuple[float, float, float] | None:
+    """Return (slope, intercept, residual RMS) for an ordinary least-squares fit."""
+    count = len(xs)
+    if count < 2 or count != len(ys):
+        return None
+    x_mean = math.fsum(xs) / count
+    y_mean = math.fsum(ys) / count
+    denominator = math.fsum((x - x_mean) ** 2 for x in xs)
+    if denominator <= EPS:
+        return None
+    numerator = math.fsum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    slope = numerator / denominator
+    intercept = y_mean - slope * x_mean
+    residuals = [y - (intercept + slope * x) for x, y in zip(xs, ys)]
+    rms = math.sqrt(math.fsum(r * r for r in residuals) / count)
+    return slope, intercept, rms
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return low if value < low else high if value > high else value
+
+
+def logit(probability: float) -> float:
+    p = clamp(probability, 1.0e-15, 1.0 - 1.0e-15)
     return math.log(p / (1.0 - p))
 
-def unlogit(l):
-    if l >= 0:
-        return 100.0 / (1.0 + math.exp(-l))
-    e = math.exp(l) if l > -700 else 0.0
-    return 100.0 * e / (1.0 + e)
 
-def parse_iso(s):
-    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+def unlogit_percent(value: float) -> float:
+    """Invert the logit transform directly into percentage points."""
+    if value >= 0.0:
+        if value > 50.0:
+            return 100.0
+        return 100.0 / (1.0 + math.exp(-value))
+    if value < -50.0:
+        return 0.0
+    exp_value = math.exp(value)
+    return 100.0 * exp_value / (1.0 + exp_value)
 
-def hours_since_launch(rd):
-    t0 = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
-    return max((parse_iso(rd["at"]) - t0).total_seconds() / 3600.0, 0.0)
 
-def fit_powerlaw(xs, ys):
-    """LSQ fit y = a + b*x over (ln(1+h), ln(value)). Returns (a, b, resid_sd)."""
-    n = len(xs)
-    if n < 2:
-        return None
-    mx = sum(xs) / n; my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx <= 1e-12:
-        return (my, 0.0, 0.0)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    b = sxy / sxx
-    a = my - b * mx
-    if n >= 3:
-        resid = math.sqrt(sum((y - (a + b * x)) ** 2 for x, y in zip(xs, ys)) / (n - 1))
+def tracked_change_points(reads: Sequence[dict]) -> list[tuple[float, float]]:
+    """Keep the initial observation and each later change in tracked count."""
+    if not reads:
+        return []
+    start = parse_rfc3339(reads[0]["at"])
+    points: list[tuple[float, float]] = []
+    previous: float | None = None
+    for read in reads:
+        h = hours_between(start, parse_rfc3339(read["at"]))
+        tracked = max(0.0, float(read["players_tracked"]))
+        if previous is None or tracked != previous:
+            points.append((h, tracked))
+        previous = tracked
+    return points
+
+
+def tracked_forecast(
+    points: Sequence[tuple[float, float]], target_hour: float
+) -> tuple[float, float]:
+    """Return predicted tracked players and the fitted tracked slope."""
+    if not points:
+        return 1.0, 0.35
+
+    x_values = [math.log1p(max(0.0, h)) for h, _ in points]
+    y_values = [math.log(max(value, 0.5)) for _, value in points]
+    fit = linear_fit(x_values, y_values)
+
+    fitted_slope = fit[0] if fit is not None else 0.35
+    last_hour, last_tracked = points[-1]
+    x_target = math.log1p(max(0.0, target_hour))
+    x_last = math.log1p(max(0.0, last_hour))
+
+    if len(points) >= 3 and fit is not None:
+        horizon = max(0.0, target_hour - last_hour)
+        decades = math.log10(1.0 + horizon / max(last_tracked, 0.25))
+        effective_slope = fitted_slope * (0.6 ** decades)
     else:
-        resid = 0.0
-    return (a, b, resid)
+        effective_slope = 0.35
 
-def forecast(case):
-    reads = case["history"]
-    target = parse_iso(case["target"])
-    tr = [rd for rd in reads if rd.get("players_tracked")]
-    last = tr[-1]
-    h_last = hours_since_launch(last)
-    dT_h = max((target - parse_iso(last["at"])).total_seconds() / 3600.0, 0.0)
-    n_tro = len(last["rates"])
+    predicted = last_tracked * math.exp(effective_slope * (x_target - x_last))
+    return max(predicted, last_tracked), fitted_slope
 
-    # ---- tracked extrapolation ------------------------------------------
-    # use reads where tracked was actually moving (skip frozen launch-night stretch)
-    pts = [(hours_since_launch(rd), rd["players_tracked"]) for rd in tr]
-    # dedupe & require h>0
-    seen = set(); pts = [p for p in pts if not (p[0] in seen or seen.add(p[0]))]
-    moving = []
-    for h, v in pts:
-        if not moving or v != moving[-1][1]:
-            moving.append((h, v))
-    xT = math.log1p((target - datetime(2026, 11, 19, tzinfo=timezone.utc)).total_seconds() / 3600.0)
-    decades = math.log10(max(1.0 + dT_h / max(h_last, 0.25), 1.0) ) if dT_h > 0 else 0.0
-    decades = max(0.0, math.log10(1.0 + dT_h / max(h_last, 0.25)))
-    if len(moving) >= 3:
-        # fit over the most recent 6 hours of moving reads (10-min slots -> ~36 pts)
-        pts_win = [(h, v) for h, v in moving if h >= h_last - 6.0]
-        if len(pts_win) < 3:
-            pts_win = moving[-12:]
-        xs = [math.log1p(h) for h, _ in pts_win]
-        ys = [math.log(v) for _, v in pts_win]
-        fit = fit_powerlaw(xs, ys)
-        b = fit[1] if fit else 0.35
-        b_eff = b * (0.6 ** decades)
-        b_t = b
-        xL = math.log1p(h_last)
-        ln_tracked_T = math.log(last["players_tracked"]) + b_eff * (xT - xL)
-        sig_ln_tracked = 0.25 * math.sqrt(1.0 + 2.0 * decades)
+
+def recent_holder_points(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Use the six-hour tail, or the final twelve observations when sparse."""
+    if len(points) < 3:
+        return []
+    newest = points[-1][0]
+    recent = [point for point in points if point[0] >= newest - 6.0]
+    if len(recent) < 3:
+        recent = list(points[-12:])
+    return recent
+
+
+def holder_forecast(
+    points: Sequence[tuple[float, float]],
+    current_rate: float,
+    tracked_slope: float,
+    target_hour: float,
+) -> tuple[float, float]:
+    """Predict the holder count at target and return it with sigma_fit."""
+    if not points:
+        return 0.0, 0.5
+
+    x_now = math.log1p(max(0.0, points[-1][0]))
+    x_target = math.log1p(max(0.0, target_hour))
+    holder_now = min(max(0.0, points[-1][1]), 1.0e300)
+    recent = recent_holder_points(points)
+    fit = None
+    if recent:
+        fit = linear_fit(
+            [math.log1p(max(0.0, h)) for h, _ in recent],
+            [math.log(max(count, 0.5)) for _, count in recent],
+        )
+
+    if fit is not None:
+        slope = clamp(fit[0], 0.0, 1.5)
+        sigma_fit = 0.35 + fit[2] * 0.8
     else:
-        b_eff = 0.35
-        b_t = 0.35
-        ln_tracked_T = math.log(last["players_tracked"]) + b_eff * (xT - math.log1p(max(h_last, 0.25)))
-        sig_ln_tracked = 0.45 * math.sqrt(1.0 + 2.0 * decades)
+        if current_rate > 0.05:
+            share = 0.2 + 0.8 * math.sqrt(min(current_rate / 50.0, 1.0))
+        else:
+            share = 0.15
+        slope = max(0.1, tracked_slope * share)
+        sigma_fit = 0.5
 
-    # ---- per-trophy holders ---------------------------------------------
-    # holders_c = rate * tracked / 100; fit only reads where tracked was moving
-    idx_moving = [i for i, rd in enumerate(tr) if rd["players_tracked"] != tr[0]["players_tracked"]]
-    if not idx_moving:
-        idx_moving = [len(tr) - 1]
-    # tier medians as prior for cups with no signal
-    tiers = []
-    for t in case.get("trophies", []):
-        tiers.append((t.get("tier") or "bronze").lower())
-    rows_out = []
-    for ti in range(n_tro):
-        seq = []
-        for i in idx_moving:
-            rd = tr[i]
-            r = rd["rates"][ti]
-            if r is None:
-                continue
-            h = hours_since_launch(rd)
-            holders = r * rd["players_tracked"] / 100.0
-            seq.append((h, max(holders, 1e-4), r))
-        h_now, holders_now, rate_now = seq[-1][0], seq[-1][1], seq[-1][2]
-        lnH = math.log(holders_now)
-        # growth fit on log holders vs log(1+h)
-        seq_win = [s for s in seq if s[0] >= h_now - 6.0]
-        if len(seq_win) < 3:
-            seq_win = seq[-12:]
-        fit = fit_powerlaw([math.log1p(s[0]) for s in seq_win], [math.log(s[1]) for s in seq_win])
-        if fit and fit[1] > 0:
-            b_c = fit[1]; resid = fit[2]
-        else:
-            b_c = None; resid = 0.0
-        if b_c is None:
-            # no signal: holders growth tracks tracked growth partially, by rarity band
-            frac = min(rate_now / 50.0, 1.0)
-            share = 0.2 + 0.8 * (frac ** 0.5) if rate_now > 0.05 else 0.15
-            b_c = max(0.1, b_t * share)
-            sig_fit = 0.5
-        else:
-            b_c = min(max(b_c, 0.0), 1.5)
-            sig_fit = 0.35 + resid * 0.8
-        b_eff_c = b_c * (0.6 ** decades)
-        xL = math.log1p(max(h_now, 0.25))
-        lnH_T = lnH + b_eff_c * (xT - xL)
-        # uncertainty on ln holders: fit + poisson granularity + horizon
-        sig_pois = math.sqrt(1.0 / max(holders_now, 0.05)) if holders_now < 50 else 0.0
-        sig_ln_h = math.sqrt(sig_fit ** 2 + sig_pois ** 2 + (0.18 * math.sqrt(1.0 + 2.0 * decades)) ** 2)
-        # combine: rate_T = H_T / tracked_T
-        sig_ln_rate = math.sqrt(sig_ln_h ** 2 + sig_ln_tracked ** 2)
-        med_rate = math.exp(lnH_T - ln_tracked_T) * 100.0  # percent
-        # 100% cap: holders cannot exceed tracked
-        if med_rate >= 99.5:
-            med_rate = min(med_rate, 100.0 - 100.0 / max(math.exp(ln_tracked_T), 2.0))
-        med_logit = clamp_logit(med_rate)
-        # logit sigma via numeric diff of the logit map (stable at both ends), then capped
-        if med_rate > 0.5:
-            lo = max(med_rate * (1.0 - min(sig_ln_rate, 0.9)), 0.01)
-            hi = min(med_rate * (1.0 + sig_ln_rate), 99.99)
-            sig_logit = 0.5 * abs(clamp_logit(hi) - clamp_logit(lo))
-        else:
-            sig_logit = sig_ln_rate
-        sig_logit = min(sig_logit, 1.6)
-        # refresh floor: one exophase refresh can halve any rate; keep the 5% tail honest
-        floor = 0.35 + 0.30 * math.sqrt(max(dT_h, 0.0) / 24.0)
-        sig_logit = math.sqrt(sig_logit ** 2 + floor ** 2)
-        row = []
-        for tau in TAUS:
-            q = unlogit(med_logit + TAU_Z[tau] * sig_logit)
-            q = min(99.99, max(0.01, q))
-            row.append(round(q, 4))
-        # enforce monotone
-        for i in range(1, 5):
-            if row[i] < row[i - 1]:
-                row[i] = row[i - 1]
-        rows_out.append(row)
-    return rows_out
+    if holder_now <= 0.0:
+        return 0.0, sigma_fit
+    predicted = holder_now * math.exp(slope * (x_target - x_now))
+    return predicted, sigma_fit
 
-def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or (sys.argv[1] if len(sys.argv) > 1 else "/input")
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or (sys.argv[2] if len(sys.argv) > 2 else "/output")
-    os.makedirs(out_dir, exist_ok=True)
-    for fn in sorted(os.listdir(in_dir)):
-        if not fn.endswith(".in"):
+
+def logit_sigma(predicted_rate: float, sigma_rate: float) -> float:
+    """Delta-method logit uncertainty with safe one-sided derivatives."""
+    p = predicted_rate / 100.0
+    if p <= 0.0 or p >= 1.0:
+        return 1.6
+
+    step = max(sigma_rate, 1.0e-12)
+    half = step / 2.0
+    near_zero = p - half <= 1.0e-12
+    near_one = p + half >= 1.0 - 1.0e-12
+
+    if near_zero and near_one:
+        derivative = 1.0 / max(p * (1.0 - p), 1.0e-12)
+    elif near_zero:
+        upper = min(1.0 - 1.0e-15, p + half)
+        derivative = (logit(upper) - logit(p)) / max(upper - p, 1.0e-15)
+    elif near_one:
+        lower = max(1.0e-15, p - half)
+        derivative = (logit(p) - logit(lower)) / max(p - lower, 1.0e-15)
+    else:
+        lower = max(1.0e-15, p - half)
+        upper = min(1.0 - 1.0e-15, p + half)
+        derivative = (logit(upper) - logit(lower)) / (upper - lower)
+    return min(sigma_rate * derivative, 1.6)
+
+
+def quantiles_for_trophy(
+    holders: Sequence[tuple[float, float]],
+    rate: float,
+    tracked_slope: float,
+    tracked_target: float,
+    target_hour: float,
+    horizon_days: float,
+) -> list[float]:
+    if not holders or rate <= 0.0 or tracked_target <= 0.0:
+        return [MIN_PERCENT] * 5
+
+    holder_target, sigma_fit = holder_forecast(
+        holders, rate, tracked_slope, target_hour
+    )
+    if holder_target <= 0.0:
+        return [MIN_PERCENT] * 5
+
+    predicted_rate = 100.0 * holder_target / tracked_target
+    p = clamp(predicted_rate / 100.0, 1.0e-12, 1.0 - 1.0e-12)
+    center = logit(p)
+    sigma_rate = max(sigma_fit * math.sqrt(1.0 + max(0.0, horizon_days)), 0.10)
+    sigma_logit = logit_sigma(predicted_rate, sigma_rate)
+
+    values = [unlogit_percent(center + z * sigma_logit) for z in QUANTILE_Z]
+    values = [clamp(value, MIN_PERCENT, MAX_PERCENT) for value in values]
+    values.sort()
+    return [round(value, 4) for value in values]
+
+
+def forecast_case(case: dict) -> dict:
+    raw_reads = list(case.get("history") or [])
+    raw_reads.sort(key=lambda read: parse_rfc3339(read["at"]))
+    if not raw_reads:
+        trophies = case.get("trophies") or []
+        return {"trophies": [{"id": int(t["id"]), "q": [MIN_PERCENT] * 5} for t in trophies]}
+
+    start = parse_rfc3339(raw_reads[0]["at"])
+    target_value = case["target"]
+    target_at = target_value["at"] if isinstance(target_value, dict) else target_value
+    target_time = parse_rfc3339(target_at)
+    target_hour = hours_between(start, target_time)
+    last_read_time = parse_rfc3339(raw_reads[-1]["at"])
+    horizon_days = max(0.0, hours_between(last_read_time, target_time) / 24.0)
+
+    changes = tracked_change_points(raw_reads)
+    tracked_target, tracked_slope = tracked_forecast(changes, target_hour)
+
+    trophies = list(case.get("trophies") or [])
+    rates = list(raw_reads[-1].get("rates") or [])
+    holder_series: list[list[tuple[float, float]]] = [[] for _ in trophies]
+    for read in raw_reads:
+        read_time = parse_rfc3339(read["at"])
+        h = hours_between(start, read_time)
+        tracked = float(read["players_tracked"])
+        is_change = any(abs(h - point[0]) <= 1.0e-12 for point in changes)
+        if not is_change:
             continue
-        case = json.load(open(os.path.join(in_dir, fn)))
-        rows = forecast(case)
-        trophies = [{"id": case["trophies"][i]["id"], "q": rows[i]} for i in range(len(rows))]
-        out_id = fn[:-3] + ".out"
-        with open(os.path.join(out_dir, out_id), "w") as f:
-            json.dump({"trophies": trophies}, f, separators=(",", ":"))
-            f.write("\n")
-        print(f"wrote {out_id}: {len(trophies)} trophies")
+        read_rates = list(read.get("rates") or [])
+        for index in range(len(trophies)):
+            if index >= len(read_rates):
+                continue
+            holder_count = round(float(read_rates[index]) * tracked / 100.0)
+            holder_series[index].append((h, float(holder_count)))
+
+    results = []
+    for index, trophy in enumerate(trophies):
+        rate = float(rates[index]) if index < len(rates) else 0.0
+        q = quantiles_for_trophy(
+            holder_series[index],
+            rate,
+            tracked_slope,
+            tracked_target,
+            target_hour,
+            horizon_days,
+        )
+        results.append({"id": int(trophy["id"]), "q": q})
+    return {"trophies": results}
+
+
+def input_directory(argv: Sequence[str]) -> str:
+    if "MAKEFUN_INPUT_DIR" in os.environ:
+        return os.environ["MAKEFUN_INPUT_DIR"]
+    return argv[1] if len(argv) > 1 else "/input"
+
+
+def output_directory(argv: Sequence[str]) -> str:
+    if "MAKEFUN_OUTPUT_DIR" in os.environ:
+        return os.environ["MAKEFUN_OUTPUT_DIR"]
+    return argv[2] if len(argv) > 2 else "/output"
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(sys.argv if argv is None else argv)
+    in_dir = Path(input_directory(args))
+    out_dir = Path(output_directory(args))
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for input_path in sorted(in_dir.glob("p*.in"), key=lambda path: path.name):
+        with input_path.open("r", encoding="utf-8") as handle:
+            case = json.load(handle)
+        result = forecast_case(case)
+        output_path = out_dir / (input_path.stem + ".out")
+        with output_path.open("w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            handle.write("\n")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

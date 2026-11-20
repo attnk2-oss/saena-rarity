@@ -6,20 +6,26 @@ Built for the [gta6-trophy-rarity-forecast-01 bounty](https://make.fun/bounty/gt
 
 # gta6-trophy-rarity-forecast-01
 
-Offline forecaster for every GTA VI PS5 trophy on Exophase. It reads a case at
-`/input/<id>.in` and writes five earn-rate quantiles (0.01..99.99%) to
-`/output/<id>.out` as JSON.
+Offline forecaster for every GTA VI PS5 trophy on Exophase. For each case, it
+reads `p*.in` from the input directory and writes a matching `p*.out` JSON file
+with five earn-rate quantiles per trophy.
 
-The model decomposes earn rate as holders / tracked. Both the page's tracked
-player count and each trophy's holder count are extrapolated to the target with
-a decaying power law, with Poisson granularity for small holder counts and a
-prior for zero-signal trophies. Quantiles come from a logit-space uncertainty
-band combining fit, horizon, and Exophase-refresh risk. Output is deterministic.
+The model forecasts holders divided by tracked players. Tracked growth is fit
+in log space against `log1p(hours)`, then damped toward the target. Each
+trophy's holder series is fit over its recent tail when enough refresh points
+exist; sparse trophies use a rate-dependent slope prior. Forecast uncertainty
+is widened in logit space for holder-fit residual error and the target horizon,
+producing sorted quantiles clamped to `0.01..99.99` percent. All arithmetic is
+local, deterministic Python 3.13 stdlib code.
 
-Run with Python 3.13 stdlib:
+Run with environment variables:
 
 ```sh
 MAKEFUN_INPUT_DIR=/input MAKEFUN_OUTPUT_DIR=/output python3 main.py
 ```
 
-Directories may also be passed as arguments (defaults `/input` and `/output`).
+Or pass directories as arguments, with `/input` and `/output` as defaults:
+
+```sh
+python3 main.py /input /output
+```
