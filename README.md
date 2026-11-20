@@ -1,12 +1,18 @@
-# gta6-trophy-rarity-forecast-01 entry
+# gta6-trophy-rarity-forecast-01
 
-Forecasts, for every GTA VI PS5 trophy on Exophase, five quantiles of its
-earn rate at the case's target, from the case's history alone (offline).
+Offline forecaster for every GTA VI PS5 trophy on Exophase. It reads a case at
+`/input/<id>.in` and writes five earn-rate quantiles (0.01..99.99%) to
+`/output/<id>.out`.
 
-`main.py` reads `/input/<id>.in`, writes `/output/<id>.out`.
+The model decomposes earn rate as holders / tracked, extrapolates both with a
+decaying power law, adds Poisson granularity for small counts, and widens a
+logit-space uncertainty band for horizon and refresh risk.
 
-Model: decompose rate = holders / tracked, power-law extrapolation with a
-decaying exponent on both, Poisson granularity for thin counts, and a
-logit-space sigma floored so one Exophase refresh cannot blow the band.
+Run with Python 3.13 stdlib:
 
-Run: MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+```sh
+MAKEFUN_INPUT_DIR=/input MAKEFUN_OUTPUT_DIR=/output python3 main.py
+```
+
+The CLI also accepts input and output directories as arguments (defaults
+`/input` and `/output`). Output is deterministic.
