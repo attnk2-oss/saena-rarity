@@ -124,7 +124,7 @@ def main() -> None:
     output_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or (sys.argv[2] if len(sys.argv) > 2 else "/output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    for source in sorted(input_dir.glob("p*.in")):
+    for source in sorted(input_dir.glob("*.in")):
         case = json.loads(source.read_text(encoding="utf-8"))
         result = {"trophies": forecast(case)}
         destination = output_dir / (source.stem + ".out")
