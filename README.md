@@ -4,28 +4,31 @@
 
 Built for the [gta6-trophy-rarity-forecast-01 bounty](https://make.fun/bounty/gta6-trophy-rarity-forecast-01): forecast how many GTA VI players earn each trophy in week one.
 
-# gta6-trophy-rarity-forecast-01
+# Rarity forecast v3
 
-Offline forecaster for every GTA VI PS5 trophy on Exophase. For each case, it
-reads `p*.in` from the input directory and writes a matching `p*.out` JSON file
-with five earn-rate quantiles per trophy.
+This entry forecasts each GTA VI trophy's earn rate as a refresh-step band around
+the newest Exophase observation. Between player-count refreshes, Exophase repeats
+its rates, so the latest read is the strongest starting point rather than a
+series to extrapolate.
 
-The model forecasts holders divided by tracked players. Tracked growth is fit
-in log space against `log1p(hours)`, then damped toward the target. Each
-trophy's holder series is fit over its recent tail when enough refresh points
-exist; sparse trophies use a rate-dependent slope prior. Forecast uncertainty
-is widened in logit space for holder-fit residual error and the target horizon,
-producing sorted quantiles clamped to `0.01..99.99` percent. All arithmetic is
-local, deterministic Python 3.13 stdlib code.
+The forecaster detects reads where `players_tracked` changes. From the last
+observed step it measures a small, positive log-rate drift and the typical time
+between steps. That drift only tilts the last rate for the number of refreshes
+expected before the target, with shrinkage and a cap. Uncertainty is a
+log-space interval around the resulting median, widening with the square root
+of the horizon and bounded at both ends.
 
-Run with environment variables:
-
-```sh
-MAKEFUN_INPUT_DIR=/input MAKEFUN_OUTPUT_DIR=/output python3 main.py
-```
-
-Or pass directories as arguments, with `/input` and `/output` as defaults:
+## Run
 
 ```sh
-python3 main.py /input /output
+python3 main.py [IN_DIR] [OUT_DIR]
 ```
+
+`MAKEFUN_INPUT_DIR` and `MAKEFUN_OUTPUT_DIR` override the optional arguments;
+the defaults are `/input` and `/output`. Every `p*.in` case produces a matching
+`p*.out` file. Each output contains, in input order, one trophy object with its
+`id` and five non-decreasing percent quantiles (`q05`, `q25`, `q50`, `q75`,
+`q95`) rounded to four decimals and clamped to `0.01..99.99`.
+
+The implementation uses only the Python standard library, is deterministic, and
+performs no network access.
